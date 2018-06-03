@@ -1,21 +1,31 @@
 package mpashkovskiy.oasgenerator.core;
 
+import com.fasterxml.jackson.core.JsonParseException;
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonMappingException;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.swagger.models.*;
+import io.swagger.models.auth.ApiKeyAuthDefinition;
+import io.swagger.models.auth.In;
+import io.swagger.models.parameters.BodyParameter;
 import io.swagger.models.parameters.PathParameter;
 import io.swagger.models.parameters.QueryParameter;
 import io.swagger.util.Json;
+import mpashkovskiy.oasgenerator.core.utils.HttpStatus;
+import mpashkovskiy.oasgenerator.core.wrappers.HttpServletResponseCopier;
+import mpashkovskiy.oasgenerator.core.wrappers.ResettableStreamHttpServletRequest;
 import org.apache.commons.io.IOUtils;
+import org.jsonschema2pojo.SchemaGenerator;
 
-import javax.servlet.http.HttpServletRequest;
-import javax.servlet.http.HttpServletResponse;
 import java.io.IOException;
 import java.io.UnsupportedEncodingException;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.Scanner;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.BlockingQueue;
+import java.util.TreeMap;
+import java.util.UUID;
+
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
 
 public enum OasBuilder {
     INSTANCE;
@@ -45,24 +55,25 @@ public enum OasBuilder {
 
     private void updateSchema(RequestResponse rr) {
         if (specification.getPaths() == null)
-            specification.setPaths(new HashMap<>());
+            specification.setPaths(new TreeMap<>());
 
         Operation op = new Operation();
         String uri = makePatternFromURI(rr.getRequest().getRequestURI(), op);
         HttpMethod method = HttpMethod.valueOf(rr.getRequest().getMethod());
-//        if (specification.getPaths().containsKey(uri) && specification.getPaths().get(uri).getOperationMap().containsKey(method))
-//            return;
+        if (specification.getPaths().containsKey(uri) && specification.getPaths().get(uri).getOperationMap().containsKey(method))
+            return;
 
         if (specification.getHost() == null) {
-            specification.setHost(rr.getRequest().getServerName() + ":" + rr.getRequest().getServerPort());
-            specification.addScheme(Scheme.forValue(rr.getRequest().getScheme()));
+            specification
+                .host(rr.getRequest().getServerName() + ":" + rr.getRequest().getServerPort())
+                .scheme(Scheme.forValue(rr.getRequest().getScheme()));
         }
         processRequest(rr, op);
         processResponse(rr, op);
-        addPath(op, uri, method);
+        addPath(uri, method, op);
     }
 
-    private void addPath(Operation op, String uri, HttpMethod method) {
+    private void addPath(String uri, HttpMethod method, Operation op) {
         Path path = new Path();
         path.set(method.toString().toLowerCase(), op);
         specification.getPaths().put(uri, path);
@@ -70,12 +81,26 @@ public enum OasBuilder {
 
     private void processResponse(RequestResponse rr, Operation op) {
         String responseContentType = getContentType(rr.getResponse());
+        int statusCode = rr.getResponse().getStatus();
+        Response response = new Response();
+        response.setDescription(HttpStatus.getByCode(statusCode).name());
+
         if (responseContentType.equals("application/json")) {
             try {
                 byte[] copy = ((HttpServletResponseCopier) rr.getResponse()).getCopy();
                 String json = new String(copy, "UTF-8");
-                System.out.println(json);
-            } catch (UnsupportedEncodingException e) {}
+                ObjectNode schema = new SchemaGenerator().schemaFromExample(Json.mapper().readTree(json));
+                Model model = Json.mapper().readValue(schema.toString(), ModelImpl.class);
+                response.setResponseSchema(model);
+            } catch (UnsupportedEncodingException e) {
+                e.printStackTrace();
+            } catch (JsonParseException e) {
+                e.printStackTrace();
+            } catch (JsonMappingException e) {
+                e.printStackTrace();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
         }
         op.addProduces(responseContentType);
         rr.getResponse()
@@ -83,8 +108,11 @@ public enum OasBuilder {
             .stream()
             .map(String::toLowerCase)
             .filter(h -> h.startsWith("x") || h.equals("authorization"))
-            .forEach(h -> op.addSecurity(h, new ArrayList<>()));
-        op.addResponse(String.valueOf(rr.getResponse().getStatus()), new Response());
+            .forEach(h -> {
+                op.addSecurity(h, new ArrayList<>());
+                specification.addSecurityDefinition(h, new ApiKeyAuthDefinition(h, In.HEADER));
+            });
+        op.addResponse(String.valueOf(statusCode), response);
     }
 
     private void processRequest(RequestResponse rr, Operation op) {
@@ -92,7 +120,13 @@ public enum OasBuilder {
         if (requestContentType.equals("application/json")) {
             try {
                 String json = IOUtils.toString(rr.getRequest().getReader());
-                System.out.println(json);
+                ObjectNode schema = new SchemaGenerator().schemaFromExample(Json.mapper().readTree(json));
+                BodyParameter bp = new BodyParameter();
+                bp.name("body");
+                bp.setRequired(true);
+                Model model = Json.mapper().readValue(schema.toString(), ModelImpl.class);
+                bp.setSchema(model);
+                op.addParameter(bp);
             } catch (IOException e) {
                 e.printStackTrace();
             }
@@ -134,10 +168,16 @@ public enum OasBuilder {
         String prevPart = null;
         String[] parts = uri.split("/");
         for (int i = 0; i < parts.length; i++) {
-            String part = parts[i];
+            String part = parts[i].trim();
             String newPart = part;
-            if (prevPart != null && !prevPart.trim().equals("") && isInteger(part, 10)) {
-                String paramName = prevPart + "Id";
+            if (prevPart != null && prevPart.length() > 0 && isParameter(part)) {
+                String paramName = new String(prevPart);
+                if (paramName.endsWith("ies")) {
+                    paramName = paramName.substring(0, paramName.length() - 3) + "y";
+                } else if (paramName.endsWith("s")) {
+                    paramName = paramName.substring(0, paramName.length() - 1);
+                }
+                paramName += "Id";
                 PathParameter pp = new PathParameter();
                 pp.name(paramName);
                 pp.example(part);
@@ -154,10 +194,21 @@ public enum OasBuilder {
         return Json.mapper().writeValueAsString(specification);
     }
 
-    public static boolean isInteger(String s, int radix) {
+    public static boolean isParameter(String s) {
+        if (s.contains(","))
+            return true;
+
+        try {
+            UUID.fromString(s);
+            return true;
+        } catch(IllegalArgumentException e) {}
+
+        // is int?
         Scanner sc = new Scanner(s.trim());
-        if(!sc.hasNextInt(radix)) return false;
-        sc.nextInt(radix);
+        if(!sc.hasNextInt(10))
+            return false;
+
+        sc.nextInt(10);
         return !sc.hasNext();
     }
 }

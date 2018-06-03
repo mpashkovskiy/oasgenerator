@@ -1,9 +1,14 @@
-package mpashkovskiy.oasgenerator.core;
+//****************************************************************************
+// Copyright (c) 1997-2018 F-Secure Corporation. All rights reserved.
+//****************************************************************************
 
-import javax.servlet.ServletOutputStream;
+package mpashkovskiy.oasgenerator.core.wrappers;
+
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+
+import javax.servlet.ServletOutputStream;
 
 public class ServletOutputStreamCopier extends ServletOutputStream {
 

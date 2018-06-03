@@ -1,4 +1,8 @@
-package mpashkovskiy.oasgenerator.core;
+//****************************************************************************
+// Copyright (c) 1997-2018 F-Secure Corporation. All rights reserved.
+//****************************************************************************
+
+package mpashkovskiy.oasgenerator.core.wrappers;
 
 import javax.servlet.ServletOutputStream;
 import javax.servlet.http.HttpServletResponse;
