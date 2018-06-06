@@ -2,7 +2,6 @@ package mpashkovskiy.oasgenerator.jeeexample;
 
 import mpashkovskiy.oasgenerator.core.OasBuilder;
 import mpashkovskiy.oasgenerator.core.wrappers.HttpServletResponseCopier;
-import mpashkovskiy.oasgenerator.core.wrappers.ResettableStreamHttpServletRequest;
 
 import javax.servlet.*;
 import javax.servlet.http.HttpServletRequest;
@@ -18,10 +17,9 @@ public class OasJeeFilter implements Filter {
             response.setCharacterEncoding("UTF-8");
         }
         HttpServletResponseCopier responseCopier = new HttpServletResponseCopier((HttpServletResponse) response);
-        ResettableStreamHttpServletRequest wrappedRequest = new ResettableStreamHttpServletRequest((HttpServletRequest) request);
-        chain.doFilter(wrappedRequest, responseCopier);
+        chain.doFilter(request, responseCopier);
         responseCopier.flushBuffer();
-        OasBuilder.INSTANCE.add(wrappedRequest, responseCopier);
+        OasBuilder.INSTANCE.add((HttpServletRequest) request, responseCopier);
     }
 
     public void destroy() {}

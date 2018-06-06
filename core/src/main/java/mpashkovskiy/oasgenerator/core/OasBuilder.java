@@ -1,28 +1,29 @@
 package mpashkovskiy.oasgenerator.core;
 
-import com.fasterxml.jackson.core.JsonParseException;
 import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.JsonMappingException;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import io.swagger.models.*;
+import io.swagger.models.HttpMethod;
+import io.swagger.models.Model;
+import io.swagger.models.ModelImpl;
+import io.swagger.models.Operation;
+import io.swagger.models.Path;
+import io.swagger.models.Response;
+import io.swagger.models.Scheme;
+import io.swagger.models.Swagger;
 import io.swagger.models.auth.ApiKeyAuthDefinition;
 import io.swagger.models.auth.In;
 import io.swagger.models.parameters.BodyParameter;
 import io.swagger.models.parameters.PathParameter;
 import io.swagger.models.parameters.QueryParameter;
 import io.swagger.util.Json;
+import mpashkovskiy.oasgenerator.core.dto.UriMethodOperation;
 import mpashkovskiy.oasgenerator.core.utils.HttpStatus;
 import mpashkovskiy.oasgenerator.core.wrappers.HttpServletResponseCopier;
-import mpashkovskiy.oasgenerator.core.wrappers.ResettableStreamHttpServletRequest;
 import org.apache.commons.io.IOUtils;
 import org.jsonschema2pojo.SchemaGenerator;
 
-import java.io.IOException;
-import java.io.UnsupportedEncodingException;
-import java.util.ArrayList;
-import java.util.Scanner;
-import java.util.TreeMap;
-import java.util.UUID;
+import java.util.*;
+import java.util.concurrent.ConcurrentLinkedQueue;
 
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
@@ -30,137 +31,136 @@ import javax.servlet.http.HttpServletResponse;
 public enum OasBuilder {
     INSTANCE;
 
-//    private BlockingQueue<RequestResponse> queue;
+    private ConcurrentLinkedQueue<UriMethodOperation> queue;
     private Swagger specification;
 
     OasBuilder() {
         specification = new Swagger();
-//        queue = new ArrayBlockingQueue(10, true);
-//        Runnable runnable = () -> {
-//            while (true) {
-//                try {
-//                    updateSchema(queue.take());
-//                } catch (InterruptedException ex) {
-//                    break;
-//                }
-//            }
-//        };
-//        runnable.run();
+        queue = new ConcurrentLinkedQueue();
+        new Thread(() -> {
+            while (true) {
+                while (!queue.isEmpty())
+                    updateSchema(queue.poll());
+
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException e) {
+                    break;
+                }
+            }
+        }).start();
     }
 
     public void add(HttpServletRequest request, HttpServletResponse response) {
-//        queue.put(new RequestResponse(request, response));
-        updateSchema(new RequestResponse(request, response));
+        try {
+            if (specification.getHost() == null)
+                specification
+                        .host(request.getServerName() + ":" + request.getServerPort())
+                        .scheme(Scheme.forValue(request.getScheme()));
+
+            Operation op = new Operation();
+            String uri = makePatternFromURI(request.getRequestURI(), op);
+            HttpMethod method = HttpMethod.valueOf(request.getMethod());
+            processRequest(request, response, op);
+            processResponse(request, response, op);
+            queue.add(new UriMethodOperation(uri, method, op));
+        } catch (Throwable ex) {}
     }
 
-    private void updateSchema(RequestResponse rr) {
+    private void updateSchema(UriMethodOperation umo) {
         if (specification.getPaths() == null)
             specification.setPaths(new TreeMap<>());
 
-        Operation op = new Operation();
-        String uri = makePatternFromURI(rr.getRequest().getRequestURI(), op);
-        HttpMethod method = HttpMethod.valueOf(rr.getRequest().getMethod());
-        if (specification.getPaths().containsKey(uri) && specification.getPaths().get(uri).getOperationMap().containsKey(method))
+        if (specification.getPaths().containsKey(umo.getUri()) && specification.getPaths().get(umo.getUri()).getOperationMap().containsKey(umo.getMethod()))
             return;
 
-        if (specification.getHost() == null) {
-            specification
-                .host(rr.getRequest().getServerName() + ":" + rr.getRequest().getServerPort())
-                .scheme(Scheme.forValue(rr.getRequest().getScheme()));
-        }
-        processRequest(rr, op);
-        processResponse(rr, op);
-        addPath(uri, method, op);
-    }
+        if (umo.getOp().getSecurity() != null)
+            umo.getOp().getSecurity()
+                    .stream()
+                    .flatMap(s -> s.keySet().stream())
+                    .forEach(h -> specification.addSecurityDefinition(h, new ApiKeyAuthDefinition(h, In.HEADER)));
 
-    private void addPath(String uri, HttpMethod method, Operation op) {
         Path path = new Path();
-        path.set(method.toString().toLowerCase(), op);
-        specification.getPaths().put(uri, path);
+        path.set(umo.getMethod().toString().toLowerCase(), umo.getOp());
+        specification.getPaths().put(umo.getUri(), path);
     }
 
-    private void processResponse(RequestResponse rr, Operation op) {
-        String responseContentType = getContentType(rr.getResponse());
-        int statusCode = rr.getResponse().getStatus();
-        Response response = new Response();
-        response.setDescription(HttpStatus.getByCode(statusCode).name());
-
-        if (responseContentType.equals("application/json")) {
+    private void processRequest(HttpServletRequest httpServletRequest, HttpServletResponse httpServletResponse, Operation op) {
+        String requestContentType = getContentType(httpServletRequest);
+        if (requestContentType.equals("application/json") && httpServletResponse.getStatus() < 300) {
             try {
-                byte[] copy = ((HttpServletResponseCopier) rr.getResponse()).getCopy();
-                String json = new String(copy, "UTF-8");
-                ObjectNode schema = new SchemaGenerator().schemaFromExample(Json.mapper().readTree(json));
-                Model model = Json.mapper().readValue(schema.toString(), ModelImpl.class);
-                response.setResponseSchema(model);
-            } catch (UnsupportedEncodingException e) {
-                e.printStackTrace();
-            } catch (JsonParseException e) {
-                e.printStackTrace();
-            } catch (JsonMappingException e) {
-                e.printStackTrace();
-            } catch (IOException e) {
-                e.printStackTrace();
-            }
-        }
-        op.addProduces(responseContentType);
-        rr.getResponse()
-            .getHeaderNames()
-            .stream()
-            .map(String::toLowerCase)
-            .filter(h -> h.startsWith("x") || h.equals("authorization"))
-            .forEach(h -> {
-                op.addSecurity(h, new ArrayList<>());
-                specification.addSecurityDefinition(h, new ApiKeyAuthDefinition(h, In.HEADER));
-            });
-        op.addResponse(String.valueOf(statusCode), response);
-    }
-
-    private void processRequest(RequestResponse rr, Operation op) {
-        String requestContentType = getContentType(rr.getRequest());
-        if (requestContentType.equals("application/json")) {
-            try {
-                String json = IOUtils.toString(rr.getRequest().getReader());
-                ObjectNode schema = new SchemaGenerator().schemaFromExample(Json.mapper().readTree(json));
+                String json = IOUtils.toString(httpServletRequest.getReader());
+                SchemaGenerator schemaGenerator = new SchemaGenerator();
+                ObjectNode schema = schemaGenerator.schemaFromExample(Json.mapper().readTree(json));
                 BodyParameter bp = new BodyParameter();
                 bp.name("body");
                 bp.setRequired(true);
                 Model model = Json.mapper().readValue(schema.toString(), ModelImpl.class);
                 bp.setSchema(model);
                 op.addParameter(bp);
-            } catch (IOException e) {
+            } catch (Exception e) {
                 e.printStackTrace();
             }
-            ((ResettableStreamHttpServletRequest) rr.getRequest()).resetInputStream();
         }
         op.addConsumes(requestContentType);
-        rr.getRequest()
+        httpServletRequest
             .getParameterMap()
             .forEach((name, values) -> {
                 QueryParameter qp = new QueryParameter();
                 qp.name(name);
-                if (values != null && values.length != 0)
+                if (values != null && values.length != 0) {
                     qp.example(values[0]);
+                    qp.type(isInteger(values[0]) ? "integer" : "string");
+                }
                 op.addParameter(qp);
             });
     }
 
+    private void processResponse(HttpServletRequest httpServletRequest, HttpServletResponse httpServletResponse, Operation op) {
+        String responseContentType = getContentType(httpServletResponse);
+        int statusCode = httpServletResponse.getStatus();
+        Response response = new Response();
+        response.setDescription(HttpStatus.getByCode(statusCode).name());
+
+        if (responseContentType.equals("application/json")) {
+            try {
+                byte[] copy = ((HttpServletResponseCopier) httpServletResponse).getCopy();
+                String json = new String(copy, "UTF-8");
+                SchemaGenerator schemaGenerator = new SchemaGenerator();
+                ObjectNode schema = schemaGenerator.schemaFromExample(Json.mapper().readTree(json));
+                Model model = Json.mapper().readValue(schema.toString(), ModelImpl.class);
+                response.setResponseSchema(model);
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
+        op.addProduces(responseContentType);
+        httpServletResponse
+                .getHeaderNames()
+                .stream()
+                .map(String::toLowerCase)
+                .filter(h -> h.startsWith("x") || h.equals("authorization"))
+                .forEach(h -> op.addSecurity(h, new ArrayList<>()));
+        op.addResponse(String.valueOf(statusCode), response);
+    }
+
     private String getContentType(HttpServletRequest request) {
-        if (request.getHeader("Content-Type") != null) {
+        if (request.getHeader("Content-Type") != null)
             return request.getHeader("Content-Type").split(";")[0];
-        }
-        if (request.getContentType() != null) {
+
+        if (request.getContentType() != null)
             return request.getContentType().split(";")[0];
-        }
+
         return "application/json";
     }
 
     private String getContentType(HttpServletResponse response) {
-        if (response.getHeader("Content-Type") != null) {
+        if (response.getHeader("Content-Type") != null)
             return response.getHeader("Content-Type").split(";")[0];
-        }
-        if (response.getContentType() != null) {
+
+        if (response.getContentType() != null)
             return response.getContentType().split(";")[0];
-        }
+
         return "application/json";
     }
 
@@ -180,6 +180,7 @@ public enum OasBuilder {
                 paramName += "Id";
                 PathParameter pp = new PathParameter();
                 pp.name(paramName);
+                pp.type(isInteger(part) ? "integer" : "string");
                 pp.example(part);
                 op.addParameter(pp);
                 newPart = "{" + paramName + "}";
@@ -194,7 +195,7 @@ public enum OasBuilder {
         return Json.mapper().writeValueAsString(specification);
     }
 
-    public static boolean isParameter(String s) {
+    private static boolean isParameter(String s) {
         if (s.contains(","))
             return true;
 
@@ -203,7 +204,10 @@ public enum OasBuilder {
             return true;
         } catch(IllegalArgumentException e) {}
 
-        // is int?
+        return isInteger(s);
+    }
+
+    private static boolean isInteger(String s) {
         Scanner sc = new Scanner(s.trim());
         if(!sc.hasNextInt(10))
             return false;
